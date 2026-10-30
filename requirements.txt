@@ -2,4 +2,5 @@ fastapi
 uvicorn[standard]
 requests
 psycopg2-binary
+jsonschema>=4.22
 pydantic
