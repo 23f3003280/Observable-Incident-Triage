@@ -48,6 +48,11 @@ app.add_middleware(
 # ----------------------------- persistence ---------------------------------
 
 def db():
+    # Render persistent-disk mount paths may not exist until first startup.
+    if DB_PATH != ":memory:":
+        parent = os.path.dirname(os.path.abspath(DB_PATH))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=20, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -310,10 +315,15 @@ def validate_plan(plan, incident, catalog, policy):
 
 def make_dispatch(run, tool_name, arguments, evidence, phase, logical=None,
                   attempt=1, approval=None, approval_nonce=None, parent_span=None):
-    action_id = logical["actionId"] if logical else opaque("action")
-    call_id = logical["callId"] if logical else opaque("call")
+    # New logical actions need fresh opaque IDs; retries reuse both IDs.
+    if logical is None:
+        logical = {}
+    action_id = logical.get("actionId") or opaque("action")
+    call_id = logical.get("callId") or opaque("call")
+    logical["actionId"] = action_id
+    logical["callId"] = call_id
     client_span = hex_id(8)
-    tp = "00-" + run["traceId"] + "-" + client_span + "-01"
+    tp = "00-" + run["traceId"] + "-" + client_span + "-" + run.get("traceFlags", "01")
     item = {
         "actionId": action_id, "callId": call_id, "phase": phase,
         "toolName": tool_name, "arguments": arguments,
@@ -370,7 +380,8 @@ def build_initial(request, body):
         "marker": str(body["publicMarker"]), "traceId": trace_id,
         "serverSpanId": server_id, "agentSpanId": agent_id,
         "modelSpanId": model_id, "incomingParent": incoming_parent,
-        "tracestate": tracestate, "actionLog": [], "receiptLog": [],
+        "tracestate": tracestate, "traceFlags": (parse_traceparent(request.headers.get("traceparent")) or {}).get("flags", "01"),
+        "actionLog": [], "receiptLog": [],
         "pending": {}, "logicalSpans": {}, "clientSpans": [],
         "receiptIds": {}, "approvalPending": None, "approvalReceipt": None,
         "outgoing": [], "outgoingApprovals": [], "suppressed": [],
