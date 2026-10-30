@@ -20,7 +20,7 @@ import json
 import time
 import uuid
 import hashlib
-import sqlite3
+import sqlite3  # Local-development fallback only
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +33,7 @@ PROFILE = "ga5-incident-agent/v2"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 API_KEY = os.getenv("GEMINI_API_KEY", "")
 DB_PATH = os.getenv("DATABASE_PATH", "incident_state.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_LOCK = threading.RLock()
 
 app = FastAPI(title="Observable Incident Triage Agent", version="2.0")
@@ -47,8 +48,48 @@ app.add_middleware(
 
 # ----------------------------- persistence ---------------------------------
 
+class PGConnection:
+    """Small compatibility wrapper so the state-machine SQL stays readable."""
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, params=()):
+        cur = self.conn.cursor()
+        # Existing queries use SQLite-style placeholders; translate for psycopg2.
+        cur.execute(sql.replace("?", "%s"), params)
+        return cur
+
+    def close(self):
+        self.conn.close()
+
+
 def db():
-    # Render persistent-disk mount paths may not exist until first startup.
+    if DATABASE_URL:
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+        except ImportError as exc:
+            raise RuntimeError("PostgreSQL driver is missing; install psycopg2-binary") from exc
+        dsn = DATABASE_URL
+        if dsn.startswith("postgres://"):
+            dsn = "postgresql://" + dsn[len("postgres://"): ]
+        conn = psycopg2.connect(dsn, connect_timeout=10, cursor_factory=RealDictCursor)
+        # DDL/query helpers run in autocommit; save_state opens its own transaction.
+        conn.autocommit = True
+        wrapped = PGConnection(conn)
+        wrapped.execute("""CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
+            state_json TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL
+        )""")
+        wrapped.execute("""CREATE TABLE IF NOT EXISTS receipts (
+            run_id TEXT NOT NULL, receipt_id TEXT NOT NULL,
+            body_hash TEXT NOT NULL, response_json TEXT NOT NULL,
+            PRIMARY KEY(run_id, receipt_id)
+        )""")
+        return wrapped
+
+    # SQLite is retained only for local development. Render should use DATABASE_URL.
     if DB_PATH != ":memory:":
         parent = os.path.dirname(os.path.abspath(DB_PATH))
         if parent:
@@ -81,7 +122,10 @@ def save_state(run_id, request_hash, state):
     with DB_LOCK:
         c = db()
         try:
-            c.execute("BEGIN IMMEDIATE")
+            if DATABASE_URL:
+                c.execute("BEGIN")
+            else:
+                c.execute("BEGIN IMMEDIATE")
             old = c.execute("SELECT request_hash FROM runs WHERE run_id=?", (run_id,)).fetchone()
             if old and old["request_hash"] != request_hash:
                 raise HTTPException(409, "runId already exists with different content")
@@ -127,9 +171,9 @@ def save_receipt_response(run_id, receipt_id, body_hash, response):
     with DB_LOCK:
         c = db()
         try:
-            c.execute("INSERT INTO receipts(run_id,receipt_id,body_hash,response_json) VALUES(?,?,?,?)",
-                      (run_id, receipt_id, body_hash, canonical(response)))
-        except sqlite3.IntegrityError:
+            c.execute("""INSERT INTO receipts(run_id,receipt_id,body_hash,response_json)
+                VALUES(?,?,?,?) ON CONFLICT(run_id,receipt_id) DO NOTHING""",
+                (run_id, receipt_id, body_hash, canonical(response)))
             row = c.execute("SELECT body_hash,response_json FROM receipts WHERE run_id=? AND receipt_id=?",
                             (run_id, receipt_id)).fetchone()
             if not row or row["body_hash"] != body_hash:
@@ -516,7 +560,12 @@ def finalize(run):
 
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(422, "request body must be a JSON object")
     response = build_initial(request, body)
     return JSONResponse(response)
 
