@@ -23,7 +23,7 @@ class ActionAttempt:
         self.receipt = None
 
 class ActionState:
-    def __init__(self, actionId, callId, toolName, phase, arguments, evidence, exec_tool_span_id):
+    def __init__(self, actionId: str, callId: str, toolName: str, phase: str, arguments: dict, evidence: List[str], exec_tool_span_id: str):
         self.actionId = actionId
         self.callId = callId
         self.toolName = toolName
@@ -32,28 +32,31 @@ class ActionState:
         self.evidence = evidence
         self.exec_tool_span_id = exec_tool_span_id
         self.attempts: List[ActionAttempt] = []
-        self.status = "pending" # pending, success, failed, retry
+        self.status = "pending" # pending, success, failed, retry, timeout
 
 class RunState:
     def __init__(self):
         self.raw_req = {}
         self.runId = ""
         self.publicMarker = ""
-        self.trace_id = secrets.token_hex(16)
-        self.server_span_id = secrets.token_hex(8)
-        self.agent_span_id = secrets.token_hex(8)
-        self.chat_span_id = secrets.token_hex(8)
+        
+        self.trace_id = ""
         self.parent_span_id = None
         self.tracestate = None
+        
+        self.server_span_id = ""
+        self.agent_span_id = ""
+        self.chat_span_id = ""
         self.start_time_ns = time.time_ns()
         
         self.status = "waiting"
-        self.phase = "INIT"
+        self.phase = "INIT" # INIT, DIAGNOSTICS, APPROVAL, EFFECT, DONE
         self.diagnosis = {}
         self.effect_plan = {}
-        self.ev_pool = []
         
         self.actions: List[ActionState] = []
+        
+        self.effect_action_id = None
         self.approval_req = None
         self.approval_receipt = None
         
@@ -64,13 +67,20 @@ class RunState:
         self.seen_receipt_bodies = {}
         self.last_response = {}
 
-# ----------------- UTILS & LLM (GEMINI 1.5 FLASH) -----------------
+# ----------------- UTILS -----------------
+def hex_id(length_bytes: int) -> str:
+    while True:
+        v = secrets.token_hex(length_bytes)
+        if int(v, 16) != 0:
+            return v
+
 def canonical_json(data: dict) -> str:
     return json.dumps(data, separators=(',', ':'), sort_keys=True)
 
 def get_digest(args: dict) -> str:
     return hashlib.sha256(canonical_json(args).encode('utf-8')).hexdigest().lower()
 
+# ----------------- LLM CALL -----------------
 def call_llm(req_json: dict) -> dict:
     api_key = os.getenv("GEMINI_API_KEY")
     incident = req_json.get("incident", {})
@@ -78,6 +88,9 @@ def call_llm(req_json: dict) -> dict:
     catalog = req_json.get("toolCatalog", [])
     
     valid_evs = re.findall(r'\[(ev_[a-zA-Z0-9_-]+)\]', incident.get("transcript", ""))
+    seen = set()
+    valid_evs = [x for x in valid_evs if not (x in seen or seen.add(x))]
+    
     diag_tools = [t for t in catalog if t.get("name") not in policy.get("effectTools", [])]
     eff_tools = [t for t in catalog if t.get("name") in policy.get("effectTools", [])]
     
@@ -91,52 +104,36 @@ def call_llm(req_json: dict) -> dict:
     if not api_key:
         return fallback
         
-    prompt = f"""You are an expert incident response AI. Find the root cause and required tools.
-Incident: {incident.get('title')}
-Severity: {incident.get('severity')}
-Transcript: {incident.get('transcript')}
-
+    prompt = f"""You are an incident response agent.
 Allowed Root Causes: {json.dumps(incident.get('allowedRootCauses'))}
-Valid Evidence IDs from transcript: {json.dumps(valid_evs)}
+Valid Evidence IDs: {json.dumps(valid_evs)}
+Diagnostic Tools (JSON schema): {json.dumps(diag_tools)}
+Effect Tools (JSON schema): {json.dumps(eff_tools)}
+Transcript: {json.dumps(incident.get('transcript'))}
 
-Diagnostic Tools Available (JSON schemas):
-{json.dumps(diag_tools, indent=2)}
-
-Effect Tools Available (JSON schemas):
-{json.dumps(eff_tools, indent=2)}
-
-Maximum Diagnostics Allowed: {policy.get('maximumDiagnostics', 3)}
-
-Task:
-1. Determine the exact root cause from the Allowed Root Causes.
-2. Choose 2 to 4 Evidence IDs from the valid list that support this cause.
-3. Select 1 to {policy.get('maximumDiagnostics', 3)} Diagnostic Tools to verify the issue. Provide exact arguments based on the tool schemas.
-4. Select exactly 1 Effect Tool to fix the issue. Provide exact arguments based on the tool schemas.
-
-Output strictly as a JSON object matching this exact schema:
+Analyze the transcript to determine the EXACT root cause from Allowed Root Causes and extract required exact tool arguments.
+Output MUST be exactly this JSON:
 {{
-  "rootCause": "chosen cause string",
-  "evidence": ["ev_...", "ev_..."],
+  "rootCause": "...",
+  "evidence": ["ev_1", "ev_2"],
   "diagnostics": [{{"toolName": "...", "arguments": {{}} }}],
   "effect": {{"toolName": "...", "arguments": {{}} }}
 }}"""
-    
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
     data = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}
     }
     
-    req_obj = urllib.request.Request(
-        url, data=json.dumps(data).encode('utf-8'),
-        headers={"Content-Type": "application/json"}, method="POST"
-    )
-    
     try:
+        req_obj = urllib.request.Request(
+            url, data=json.dumps(data).encode('utf-8'),
+            headers={"Content-Type": "application/json"}, method="POST"
+        )
         with urllib.request.urlopen(req_obj) as response:
             res_body = json.loads(response.read().decode('utf-8'))
             text_result = res_body["candidates"][0]["content"]["parts"][0]["text"]
-            # Safely extract JSON in case Gemini includes markdown backticks despite mimeType
             match = re.search(r'\{.*\}', text_result, re.DOTALL)
             if match:
                 result = json.loads(match.group(0))
@@ -146,14 +143,18 @@ Output strictly as a JSON object matching this exact schema:
             validated_ev = [e for e in result.get("evidence", []) if e in valid_evs]
             if len(validated_ev) < 2:
                 validated_ev = (validated_ev + valid_evs)[:2]
-            result["evidence"] = list(set(validated_ev))[:4]
+            result["evidence"] = list(dict.fromkeys(validated_ev))[:4]
             return result
     except Exception as e:
         print("LLM Error:", e)
         return fallback
 
+# ----------------- DISPATCH & OTLP -----------------
 def create_dispatch(state: RunState, action: ActionState) -> dict:
-    attempt_obj = ActionAttempt(attempt=len(action.attempts) + 1, client_span_id=secrets.token_hex(8))
+    attempt_num = len(action.attempts) + 1
+    client_span_id = hex_id(8)
+    attempt = ActionAttempt(attempt=attempt_num, client_span_id=client_span_id)
+    
     dispatch = {
         "actionId": action.actionId,
         "callId": action.callId,
@@ -161,32 +162,31 @@ def create_dispatch(state: RunState, action: ActionState) -> dict:
         "toolName": action.toolName,
         "arguments": action.arguments,
         "evidence": action.evidence,
-        "attempt": attempt_obj.attempt,
-        "traceparent": f"00-{state.trace_id}-{attempt_obj.client_span_id}-01"
+        "attempt": attempt_num,
+        "traceparent": f"00-{state.trace_id}-{client_span_id}-01"
     }
+    
     if state.tracestate:
         dispatch["tracestate"] = state.tracestate
     if action.phase == "effect" and state.approval_receipt:
         dispatch["approvalId"] = state.approval_receipt["approvalId"]
         dispatch["approvalNonce"] = state.approval_receipt["nonce"]
         
-    attempt_obj.dispatch_dict = dispatch
-    action.attempts.append(attempt_obj)
+    attempt.dispatch_dict = dispatch
+    action.attempts.append(attempt)
     state.actionLog.append(dispatch)
     return dispatch
 
-# ----------------- OTLP GENERATION -----------------
 def attr_str(k, v): return {"key": k, "value": {"stringValue": str(v)}}
 def attr_int(k, v): return {"key": k, "value": {"intValue": v}}
 
 def generate_otlp(state: RunState) -> dict:
     spans = []
-    current_time = state.start_time_ns
-    
+    current_t = state.start_time_ns
     def tick():
-        nonlocal current_time
-        current_time += 1000000
-        return str(current_time)
+        nonlocal current_t
+        current_t += 1000000
+        return str(current_t)
         
     base_attrs = [attr_str("ga5.run.id", state.runId), attr_str("ga5.public.marker", state.publicMarker)]
     
@@ -267,7 +267,7 @@ def generate_otlp(state: RunState) -> dict:
             
     if len(diag_exec_span_ids) > 1:
         join_span = {
-            "traceId": state.trace_id, "spanId": secrets.token_hex(8), "parentSpanId": state.agent_span_id,
+            "traceId": state.trace_id, "spanId": hex_id(8), "parentSpanId": state.agent_span_id,
             "name": "incident.join", "kind": 1,
             "startTimeUnixNano": tick(), "endTimeUnixNano": tick(),
             "attributes": base_attrs,
@@ -279,7 +279,7 @@ def generate_otlp(state: RunState) -> dict:
         
     if state.approval_receipt:
         app_span = {
-            "traceId": state.trace_id, "spanId": secrets.token_hex(8), "parentSpanId": state.agent_span_id,
+            "traceId": state.trace_id, "spanId": hex_id(8), "parentSpanId": state.agent_span_id,
             "name": "approval_gate", "kind": 1,
             "startTimeUnixNano": tick(), "endTimeUnixNano": tick(),
             "attributes": base_attrs + [
@@ -293,26 +293,34 @@ def generate_otlp(state: RunState) -> dict:
 
     return {"resourceSpans": [{"scopeSpans": [{"spans": spans}]}]}
 
-def build_final_response(state: RunState) -> dict:
-    suppressed = [state.effect_plan["toolName"]] if state.status == "failed" else []
-    return {
-        "runId": state.runId,
-        "status": state.status,
-        "diagnosis": state.diagnosis,
-        "chosenEffect": state.effect_plan.get("toolName", ""),
-        "suppressed": suppressed,
-        "actionLog": state.actionLog,
-        "receiptLog": state.receiptLog,
-        "otlp": generate_otlp(state),
-        "dispatches": [],
-        "approvals": []
-    }
+def build_response(state: RunState, dispatches: list = None, approvals: list = None) -> dict:
+    if state.phase == "DONE":
+        suppressed = [state.effect_plan.get("toolName", "")] if state.status == "failed" else []
+        resp = {
+            "runId": state.runId,
+            "status": state.status,
+            "diagnosis": state.diagnosis,
+            "chosenEffect": state.effect_plan.get("toolName", ""),
+            "suppressed": suppressed,
+            "actionLog": state.actionLog,
+            "receiptLog": state.receiptLog,
+            "otlp": generate_otlp(state)
+        }
+        return resp
+    else:
+        return {
+            "runId": state.runId,
+            "status": state.status,
+            "diagnosis": state.diagnosis,
+            "dispatches": dispatches if dispatches is not None else [],
+            "approvals": approvals if approvals is not None else []
+        }
 
 # ----------------- API ENDPOINTS -----------------
 @app.get("/v2/incidents/{runId}")
 async def get_incident(runId: str):
     if runId not in RUNS:
-        raise HTTPException(404)
+        raise HTTPException(status_code=404)
     return RUNS[runId].last_response
 
 @app.post("/v2/incidents")
@@ -320,15 +328,15 @@ async def create_incident(request: Request, traceparent: Optional[str] = Header(
     try:
         body_json = json.loads(await request.body())
     except:
-        raise HTTPException(400)
+        raise HTTPException(status_code=400)
         
     if body_json.get("profile") != "ga5-incident-agent/v2":
-        raise HTTPException(422)
+        raise HTTPException(status_code=422)
         
     run_id = body_json.get("runId")
     if run_id in RUNS:
         if canonical_json(RUNS[run_id].raw_req) != canonical_json(body_json):
-            raise HTTPException(409)
+            raise HTTPException(status_code=409)
         return RUNS[run_id].last_response
         
     state = RunState()
@@ -342,46 +350,49 @@ async def create_incident(request: Request, traceparent: Optional[str] = Header(
             state.trace_id = parts[1]
             state.parent_span_id = parts[2]
             state.tracestate = tracestate
+    if not state.trace_id:
+        state.trace_id = hex_id(16)
+        
+    state.server_span_id = hex_id(8)
+    state.agent_span_id = hex_id(8)
+    state.chat_span_id = hex_id(8)
             
     llm_res = call_llm(body_json)
-    state.diagnosis = {"rootCause": llm_res.get("rootCause"), "evidence": llm_res.get("evidence", [])}
+    state.diagnosis = {"rootCause": llm_res.get("rootCause", ""), "evidence": llm_res.get("evidence", [])}
     state.effect_plan = llm_res.get("effect", {})
-    state.ev_pool = list(state.diagnosis["evidence"])
+    ev_pool = list(state.diagnosis["evidence"])
     
     dispatches = []
     for d_plan in llm_res.get("diagnostics", []):
+        ev = ev_pool.pop(0) if ev_pool else state.diagnosis["evidence"][0]
         action = ActionState(
-            actionId=str(uuid.uuid4()), callId=str(uuid.uuid4()), toolName=d_plan["toolName"],
-            phase="diagnostic", arguments=d_plan.get("arguments", {}),
-            evidence=[state.ev_pool.pop(0)] if state.ev_pool else [state.diagnosis["evidence"][0]],
-            exec_tool_span_id=secrets.token_hex(8)
+            actionId=uuid.uuid4().hex, callId=uuid.uuid4().hex, toolName=d_plan["toolName"],
+            phase="diagnostic", arguments=d_plan.get("arguments", {}), evidence=[ev],
+            exec_tool_span_id=hex_id(8)
         )
         state.actions.append(action)
         dispatches.append(create_dispatch(state, action))
         
     state.phase = "DIAGNOSTICS"
-    resp = {
-        "runId": state.runId, "status": "waiting",
-        "diagnosis": state.diagnosis, "dispatches": dispatches, "approvals": []
-    }
-    state.last_response = resp
+    state.last_response = build_response(state, dispatches=dispatches, approvals=[])
     RUNS[run_id] = state
-    return resp
+    return state.last_response
 
 @app.post("/v2/incidents/{runId}/receipts")
 async def post_receipts(runId: str, request: Request):
     if runId not in RUNS:
-        raise HTTPException(404)
+        raise HTTPException(status_code=404)
     state = RUNS[runId]
+    
     try:
         body_json = json.loads(await request.body())
     except:
-        raise HTTPException(400)
+        raise HTTPException(status_code=400)
         
     receipt_id = body_json.get("receiptId")
     if receipt_id in state.seen_receipts:
         if canonical_json(state.seen_receipt_bodies[receipt_id]) != canonical_json(body_json):
-            raise HTTPException(409)
+            raise HTTPException(status_code=409)
         return state.last_response
         
     state.seen_receipts.add(receipt_id)
@@ -393,16 +404,16 @@ async def post_receipts(runId: str, request: Request):
         state.receiptLog.append(out_copy)
         
         action = next((a for a in state.actions if a.actionId == out_copy.get("actionId")), None)
-        if action:
+        if action and action.status in ["pending", "retry"]:
             attempt = next((a for a in action.attempts if a.attempt == out_copy.get("attempt")), None)
             if attempt:
                 attempt.receipt = out_copy
                 if out_copy.get("status") == 0 and out_copy.get("errorType") == "timeout":
-                    action.status = "failed"
+                    action.status = "timeout"
                     state.status = "failed"
                     state.phase = "DONE"
                 elif out_copy.get("status") == 503:
-                    if attempt.attempt >= 2: # Max 1 retry rule
+                    if attempt.attempt >= 2:
                         action.status = "failed"
                         state.status = "failed"
                         state.phase = "DONE"
@@ -410,6 +421,10 @@ async def post_receipts(runId: str, request: Request):
                         action.status = "retry"
                 elif out_copy.get("status") == 200:
                     action.status = "success"
+                else:
+                    action.status = "failed"
+                    state.status = "failed"
+                    state.phase = "DONE"
 
     for app in body_json.get("approvals", []):
         app_copy = dict(app)
@@ -417,8 +432,8 @@ async def post_receipts(runId: str, request: Request):
         state.receiptLog.append(app_copy)
         state.approval_receipt = app_copy
         
-    if state.status == "failed":
-        state.last_response = build_final_response(state)
+    if state.phase == "DONE":
+        state.last_response = build_response(state)
         return state.last_response
 
     if state.phase == "DIAGNOSTICS":
@@ -429,55 +444,64 @@ async def post_receipts(runId: str, request: Request):
                 if a.status == "retry":
                     a.status = "pending"
                     dispatches.append(create_dispatch(state, a))
-            state.last_response = {"runId": state.runId, "status": "waiting", "diagnosis": state.diagnosis, "dispatches": dispatches, "approvals": []}
+            state.last_response = build_response(state, dispatches=dispatches, approvals=[])
             return state.last_response
             
         if all(a.status == "success" for a in diag_actions):
-            eff_tool = state.effect_plan.get("toolName")
+            eff_tool = state.effect_plan.get("toolName", "")
             req_approvals = state.raw_req.get("policy", {}).get("approvalRequiredFor", [])
             
             if eff_tool in req_approvals:
                 state.phase = "APPROVAL"
+                state.effect_action_id = uuid.uuid4().hex
                 state.approval_req = {
-                    "approvalId": str(uuid.uuid4()), "actionId": str(uuid.uuid4()),
-                    "toolName": eff_tool, "argumentsDigest": get_digest(state.effect_plan.get("arguments", {}))
+                    "approvalId": uuid.uuid4().hex,
+                    "actionId": state.effect_action_id,
+                    "toolName": eff_tool,
+                    "argumentsDigest": get_digest(state.effect_plan.get("arguments", {}))
                 }
-                state.last_response = {"status": "waiting", "dispatches": [], "approvals": [state.approval_req]}
+                state.last_response = build_response(state, dispatches=[], approvals=[state.approval_req])
                 return state.last_response
             else:
                 state.phase = "EFFECT"
+                state.effect_action_id = uuid.uuid4().hex
+                ev = state.diagnosis["evidence"][0] if state.diagnosis["evidence"] else "ev_fallback"
                 action = ActionState(
-                    actionId=str(uuid.uuid4()), callId=str(uuid.uuid4()), toolName=eff_tool, phase="effect",
-                    arguments=state.effect_plan.get("arguments", {}),
-                    evidence=[state.ev_pool.pop(0)] if state.ev_pool else [state.diagnosis["evidence"][0]],
-                    exec_tool_span_id=secrets.token_hex(8)
+                    actionId=state.effect_action_id, callId=uuid.uuid4().hex, toolName=eff_tool, phase="effect",
+                    arguments=state.effect_plan.get("arguments", {}), evidence=[ev],
+                    exec_tool_span_id=hex_id(8)
                 )
                 state.actions.append(action)
-                state.last_response = {"status": "waiting", "dispatches": [create_dispatch(state, action)], "approvals": []}
+                state.last_response = build_response(state, dispatches=[create_dispatch(state, action)], approvals=[])
                 return state.last_response
 
     if state.phase == "APPROVAL" and state.approval_receipt:
         state.phase = "EFFECT"
+        eff_tool = state.effect_plan.get("toolName", "")
+        ev = state.diagnosis["evidence"][0] if state.diagnosis["evidence"] else "ev_fallback"
         action = ActionState(
-            actionId=state.approval_req["actionId"], callId=str(uuid.uuid4()), toolName=state.effect_plan.get("toolName"), phase="effect",
-            arguments=state.effect_plan.get("arguments", {}),
-            evidence=[state.ev_pool.pop(0)] if state.ev_pool else [state.diagnosis["evidence"][0]],
-            exec_tool_span_id=secrets.token_hex(8)
+            actionId=state.effect_action_id, callId=uuid.uuid4().hex, toolName=eff_tool, phase="effect",
+            arguments=state.effect_plan.get("arguments", {}), evidence=[ev],
+            exec_tool_span_id=hex_id(8)
         )
         state.actions.append(action)
-        state.last_response = {"status": "waiting", "dispatches": [create_dispatch(state, action)], "approvals": []}
+        state.last_response = build_response(state, dispatches=[create_dispatch(state, action)], approvals=[])
         return state.last_response
         
     if state.phase == "EFFECT":
         eff_action = next((a for a in state.actions if a.phase == "effect"), None)
         if eff_action:
-            if eff_action.status == "success" or eff_action.status == "failed":
+            if eff_action.status == "success":
                 state.phase = "DONE"
-                state.status = "completed" if eff_action.status == "success" else "failed"
-                state.last_response = build_final_response(state)
+                state.status = "completed"
+                state.last_response = build_response(state)
+            elif eff_action.status in ["failed", "timeout"]:
+                state.phase = "DONE"
+                state.status = "failed"
+                state.last_response = build_response(state)
             elif eff_action.status == "retry":
                 eff_action.status = "pending"
-                state.last_response = {"runId": state.runId, "status": "waiting", "dispatches": [create_dispatch(state, eff_action)], "approvals": []}
+                state.last_response = build_response(state, dispatches=[create_dispatch(state, eff_action)], approvals=[])
                 
     return state.last_response
 
